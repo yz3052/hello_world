@@ -1,0 +1,98 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Apr  1 08:33:01 2023
+
+@author: tomyi
+"""
+
+import pandas as pd
+import numpy as np
+
+import gzip
+
+
+#---- get data
+
+root1 = r'C:\Users\tomyi\Downloads\derbit_filtered_options_chain_2023-03-30.parquet.gzip'
+i_opt_chain = pd.read_parquet(root1)
+i_opt_chain['symbol_rtcp'] = i_opt_chain['symbol'].str[:-2]
+i_opt_chain['ts'] = pd.to_datetime(i_opt_chain['timestamp'],unit='us')
+i_opt_chain['cp'] = i_opt_chain['symbol'].str[-1]
+i_opt_chain = i_opt_chain.sort_values('ts')
+
+root2 = r'C:\Users\tomyi\Downloads\deribit_filtered_book_snapshot_5_2023-03-30_OPTIONS.parquet.gzip'
+i_opt = pd.read_parquet(root2)
+i_opt['symbol_rtcp'] = i_opt['symbol'].str[:-2]
+i_opt['ts'] = pd.to_datetime(i_opt['timestamp'],unit='us')
+i_opt['cp'] = i_opt['symbol'].str[-1]
+i_opt = i_opt.sort_values('ts')
+
+list_sym_rtcp = i_opt['symbol_rtcp'].unique().tolist()
+
+root3 = r'C:\Users\tomyi\Downloads\deribit_book_snapshot_5_2023-03-30_ETH-PERPETUAL.csv'
+i_eth_perp = pd.read_csv(root3)
+i_eth_perp['ts'] = pd.to_datetime(i_eth_perp['timestamp'],unit='us')
+i_eth_perp = i_eth_perp.sort_values('ts')
+
+#---- get 20s timestamp map 
+
+list_ts_map = [pd.to_datetime('2023-03-30 00:00:00') + pd.to_timedelta(str(int(i)*20)+' seconds')
+               for i in range(int(3600*24/20))]
+df_ts_map = pd.DataFrame(list_ts_map, columns = ['ts'])
+df_ts_map=  df_ts_map.sort_values('ts')
+
+
+
+#------------------------------------------------------------------------------
+#---- study 1 - distribution of arbitrage space
+#------------------------------------------------------------------------------
+
+
+# loop thru cp-level root symbol
+
+o_results = []
+
+for rtcp in list_sym_rtcp:
+    print(rtcp, end=',')
+    
+    strike = int(rtcp.split('-')[-1])
+        
+    # merge_asof call / put prie
+    
+    t_opt_p = i_opt[i_opt['cp'].eq('P') & i_opt['symbol_rtcp'].eq(rtcp)]
+    t_opt_p = t_opt_p[['asks[0].price', 'asks[0].amount', 'bids[0].price', 'bids[0].amount', 'ts']]
+    t_opt_p.columns = [c+'_p' for c in t_opt_p.columns.tolist()]
+        
+    t_opt_c = i_opt[i_opt['cp'].eq('C') & i_opt['symbol_rtcp'].eq(rtcp)]
+    t_opt_c = t_opt_c[['asks[0].price', 'asks[0].amount', 'bids[0].price', 'bids[0].amount', 'ts']]
+    t_opt_c.columns = [c+'_c' for c in t_opt_c.columns.tolist()]
+        
+    icom = pd.merge_asof(df_ts_map, t_opt_p, left_on = 'ts', right_on = 'ts_p', tolerance = pd.to_timedelta('10 minutes'))
+    icom = pd.merge_asof(icom, t_opt_c, left_on = 'ts', right_on = 'ts_c', tolerance = pd.to_timedelta('10 minutes'))
+    
+    # merge_asof perpetual
+    
+    t_perp = i_eth_perp[['asks[0].price', 'asks[0].amount', 'bids[0].price', 'bids[0].amount', 'ts']]
+    t_perp.columns = [c+'_perp' for c in t_perp.columns.tolist()]
+    icom = pd.merge_asof(icom, t_perp, left_on = 'ts', right_on = 'ts_perp', tolerance = pd.to_timedelta('10 minutes'))
+        
+    # left merge chain
+    
+    t_chain = i_opt_chain[i_opt_chain['cp'].eq('C') & i_opt_chain['symbol_rtcp'].eq(rtcp)]
+    t_chain = t_chain[['delta', 'ts']]
+    t_chain.columns = ['delta', 'ts_chain']
+    icom = pd.merge_asof(icom, t_chain, left_on = 'ts', right_on = 'ts_chain')
+    
+    # output metrics:
+    
+    # short syn long perp
+    icom['alpha_bckwd'] = (strike - (icom['bids[0].price_p'] - icom['asks[0].price_c']) * (icom['asks[0].price_perp'] + icom['bids[0].price_perp']) / 2) - icom['asks[0].price_perp']    
+    # long syn short perp
+    icom['alpha_contango'] = icom['bids[0].price_perp'] - (strike - (icom['bids[0].price_p'] - icom['asks[0].price_c']) * (icom['asks[0].price_perp'] + icom['bids[0].price_perp']) / 2)
+    # output        
+    o = [rtcp, strike, icom['alpha_bckwd'].quantile(0.95), icom['alpha_bckwd'].max(), icom['alpha_contango'].quantile(0.95), icom['alpha_contango'].max()]    
+    o_results.append(o)
+    
+    
+o_results = pd.DataFrame(o_results, columns = ['contract', 'strike', 'bckwd_alpha_p95','bckwd_alpha_max', 'contango_alpha_p95', 'contango_alpha_max'])
+
